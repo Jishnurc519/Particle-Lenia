@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Particle Lenia — WebGL2 (color rules + slide UI + on-screen pan)</title>
+  <style>
+    :root { --bg:#0b0e12; --fg:#dfe6ee; --mut:#93a1b0; --acc:#6de3ff; --card:#12161d; --border:#1c222b; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial; }
+    canvas { display:block; position:fixed; inset:0; width:100vw; height:100vh; }
+    a, a:visited { color: var(--acc); text-decoration: none; }
+
+    /* === Sliding control panel === */
+    .panel-tab { position:fixed; left:12px; top:12px; z-index:1000; cursor:pointer; user-select:none; background:var(--card); color:var(--fg); border:1px solid var(--border); border-radius:12px; width:28px; height:72px; display:flex; align-items:center; justify-content:center; box-shadow:0 6px 18px rgba(0,0,0,0.35); }
+    .panel-tab:hover { background:#18202b; }
+
+    #panel { position:fixed; top:12px; left:48px; z-index:990; display:flex; align-items:flex-start; gap:8px; }
+    #panelInner { background: rgba(18,22,29,0.60); border:1px solid rgba(28,34,43,0.60); border-radius:14px; padding:10px 12px; box-shadow:0 6px 18px rgba(0,0,0,0.35); transform:translateX(0); transition:transform 220ms ease, opacity 220ms ease, background-color 220ms ease, border-color 220ms ease; opacity:0.35; }
+    #panelInner:hover, #panelInner:focus-within { opacity:1; background: rgba(18,22,29,0.92); border-color: rgba(28,34,43,0.95); }
+    #panel.collapsed #panelInner { transform: translateX(calc(-100% - 14px)); }
+
+    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .row label { min-width:86px; color:var(--mut); }
+    .row input[type=range] { width:150px; }
+    .btn { cursor:pointer; background:#1b2330; color:var(--fg); border:1px solid #2a3443; border-radius:10px; padding:6px 10px; }
+    .btn:hover { background:#242f3e; }
+    select { background:#1b2330; color:var(--fg); border:1px solid #2a3443; border-radius:8px; padding:4px 6px; }
+    #fps { color:var(--mut); }
+    #diag { color:#a0c7ff; margin-left:10px; }
+
+    /* === Hover HUD panner === */
+    #hudPanner { position:fixed; right:16px; bottom:16px; z-index:980; display:grid; grid-template-columns:36px 36px 36px; grid-auto-rows:36px; gap:6px; opacity:0.15; transition:opacity 150ms ease; }
+    #hudPanner:hover { opacity:1; }
+    .hudBtn { width:36px; height:36px; border-radius:9px; border:1px solid var(--border); background:var(--card); display:flex; align-items:center; justify-content:center; color:var(--fg); cursor:pointer; box-shadow:0 6px 14px rgba(0,0,0,0.25); }
+    .hudBtn:hover { background:#1a2230; }
+    .hudBtn svg { width:18px; height:18px; }
+    #btnPanUp { grid-column:2; grid-row:1; }
+    #btnPanLeft { grid-column:1; grid-row:2; }
+    #btnPanRight { grid-column:3; grid-row:2; }
+    #btnPanDown { grid-column:2; grid-row:3; }
+    #btnZoomIn { grid-column:1; grid-row:1; }
+    #btnZoomOut { grid-column:3; grid-row:3; }
+  </style>
+
+  <!-- Shader sources live in dedicated tags to avoid inline parsing issues -->
+  <script id="quad-vs" type="x-shader/x-vertex">#version 300 es
+  precision highp float; precision highp int;
+  layout(location=0) in vec2 quad; out vec2 vUV;
+  void main(){ vUV = 0.5*quad+0.5; gl_Position = vec4(quad,0.0,1.0); }
+  </script>
+
+  <script id="sim-fs" type="x-shader/x-fragment">#version 300 es
+  precision highp float; precision highp sampler2D;
+  out vec4 frag; in vec2 vUV;
+  uniform sampler2D uPos;   // positions texture (RGBA32F)
+  uniform int uSide;        // ceil(sqrt(N))
+  uniform int uCount;       // N
+  uniform float uDt;
+  uniform float uMuK, uSigK, uWK;
+  uniform float uMuG, uSigG;
+  uniform float uCRep;      // repulsion coefficient
+  uniform float uWorldR;    // soft domain radius
+  // Mouse interaction
+  uniform bool  uMouseOn;
+  uniform vec2  uMouse;       // mouse position in world units
+  uniform float uMouseR;      // influence radius (world)
+  uniform float uMouseStr;    // strength
+  uniform int   uMouseType;   // 0=attract,1=repel,2=twirl cw,3=twirl ccw
+
+  vec2 idx2uv(int idx){ int x = idx % uSide; int y = idx / uSide; return (vec2(x,y) + 0.5) / float(uSide); }
+  vec2 fetchPos(int idx){ return texture(uPos, idx2uv(idx)).xy; }
+  float K(float r){ float d=(r - uMuK)/uSigK; return uWK * exp(-d*d); }
+  float dK(float r){ float d=(r - uMuK)/uSigK; return K(r) * (-2.0 * d / uSigK); }
+  float G(float u){ float d=(u - uMuG)/uSigG; return exp(-d*d); }
+  float dGdu(float u){ float g=G(u); float d=(u - uMuG)/uSigG; return g * (-2.0 * d / uSigG); }
+
+  void main(){
+    ivec2 pix = ivec2(vUV * float(uSide));
+    int selfIdx = pix.x + pix.y * uSide;
+    vec2 p = texelFetch(uPos, pix, 0).xy;
+    if(selfIdx >= uCount){ frag = vec4(p, 0.0, 1.0); return; }
+
+    float U = 0.0; vec2 gradU = vec2(0.0); vec2 gradR = vec2(0.0);
+
+    for(int j=0; j<65536; ++j){
+      if(j >= uCount) break;
+      vec2 q = fetchPos(j);
+      vec2 d = p - q; float r = length(d) + 1e-6;
+      if(j != selfIdx){ if(r < 1.0){ gradR += uCRep * (r - 1.0) * (d / r); } }
+      float k = K(r); U += k; gradU += dK(r) * (d / r);
+    }
+
+    vec2 gradE = gradR - dGdu(U) * gradU;
+
+    // Mouse force (adds to ∇E)
+    if(uMouseOn){
+      vec2 dm = p - uMouse; float rm = length(dm)+1e-6;
+      float w = smoothstep(uMouseR, 0.0, rm); // near mouse -> 1
+      vec2 dir = dm / rm;
+      if(uMouseType==0){       // attract
+        gradE += -uMouseStr * w * dir;
+      } else if(uMouseType==1){ // repel
+        gradE +=  uMouseStr * w * dir;
+      } else if(uMouseType==2){ // twirl cw
+        vec2 perp = vec2(-dir.y, dir.x);
+        gradE +=  uMouseStr * w * perp;
+      } else if(uMouseType==3){ // twirl ccw
+        vec2 perp = vec2(dir.y, -dir.x);
+        gradE +=  uMouseStr * w * perp;
+      }
+    }
+
+    vec2 pNew = p - uDt * gradE; // descent
+
+    // Soft clamp to keep swarm near origin
+    float R = length(pNew);
+    if(R > uWorldR){ vec2 dir = pNew / (R + 1e-6); float t = (R - uWorldR) / max(1.0, uWorldR*0.25); pNew -= dir * t * 0.5; }
+
+    frag = vec4(pNew, 0.0, 1.0);
+  }
+  </script>
+
+  <script id="draw-vs" type="x-shader/x-vertex">#version 300 es
+  precision highp float; precision highp int;
+  layout(location=0) in vec2 dummy;
+  uniform sampler2D uPos; uniform int uSide; uniform int uCount; uniform vec3 uCam; uniform vec2 uRes;
+  out float vRadius; out vec2 vUV;
+  vec2 idx2uv(int idx){ int x = idx % uSide; int y = idx / uSide; return (vec2(x,y) + 0.5) / float(uSide); }
+  vec2 fetchPos(int idx){ return texture(uPos, idx2uv(idx)).xy; }
+  vec2 worldToScreen(vec2 p){ float aspect = uRes.x/uRes.y; float halfSpan = uCam.z*0.5; vec2 rel = p - uCam.xy; vec2 norm = rel/vec2(halfSpan*aspect, halfSpan); return norm*0.5 + 0.5; }
+  void main(){ int i = gl_VertexID; vUV = idx2uv(i); if(i >= uCount){ gl_Position = vec4(-2.0); gl_PointSize = 0.0; vRadius = 0.0; return; } vec2 p = fetchPos(i); vec2 uv = worldToScreen(p); vRadius = 1.6; gl_Position = vec4(uv*2.0-1.0, 0.0, 1.0); gl_PointSize = vRadius*2.0; }
+  </script>
+
+  <script id="draw-fs" type="x-shader/x-fragment">#version 300 es
+  precision highp float; out vec4 frag; in float vRadius; in vec2 vUV;
+  uniform sampler2D uPrev; uniform sampler2D uPos; uniform sampler2D uPosPrev;
+  uniform float uTrail; uniform vec2 uRes;
+  uniform int uRule;           // 0=index,1=radius,2=angle,3=speed
+  uniform int uNumColors;      // number of bands
+  uniform float uHueShift;     // 0..1 hue offset
+  uniform float uSat;          // 0..1
+  uniform float uVal;          // 0..1
+
+  vec3 hsv2rgb(vec3 c){
+    vec3 p = abs(fract(vec3(c.x)*6.0 + vec3(0.0,4.0,2.0)) * 2.0 - 1.0);
+    return c.z * mix(vec3(1.0), clamp((p - 1.0) + 1.0, 0.0, 1.0), c.y);
+  }
+
+  void main(){
+    vec2 uv = gl_FragCoord.xy / uRes; // trail lookup
+    vec3 bg = vec3(0.045,0.055,0.07);
+    vec4 prev = texture(uPrev, uv);
+    vec3 col = mix(prev.rgb, bg, 1.0-uTrail);
+
+    // soft point sprite
+    vec2 d = (gl_PointCoord - vec2(0.5)) * (vRadius*2.0);
+    float a = smoothstep(vRadius, 0.0, length(d));
+
+    // ---- Color rules ----
+    float s = 0.0;
+    if(uRule == 0){
+      float idx01 = fract( dot(vUV, vec2(127.1, 311.7)) );
+      s = idx01;
+    } else if(uRule == 1){
+      vec2 p = texture(uPos, vUV).xy;
+      s = clamp(length(p) / 80.0, 0.0, 1.0);
+    } else if(uRule == 2){
+      vec2 p = texture(uPos, vUV).xy; float ang = atan(p.y, p.x);
+      s = fract((ang / 6.28318530718) + 0.5);
+    } else {
+      vec2 p = texture(uPos, vUV).xy; vec2 q = texture(uPosPrev, vUV).xy;
+      float v = length(p - q);
+      s = clamp(v * 1.5, 0.0, 1.0);
+    }
+
+    float bands = float(max(uNumColors,1));
+    float k = floor(s * bands) / max(bands-0.0001, 0.0001);
+    float hue = fract(k + uHueShift);
+    vec3 rgb = hsv2rgb(vec3(hue, uSat, uVal));
+
+    col = mix(col, rgb, a);
+    frag = vec4(col, 1.0);
+  }
+  </script>
+
+  <script id="blit-fs" type="x-shader/x-fragment">#version 300 es
+  precision highp float; in vec2 vUV; out vec4 frag; uniform sampler2D uTex; void main(){ frag = texture(uTex, vUV); }
+  </script>
+</head>
+<body>
+  <!-- The tab is fixed on the page and never hidden behind other UI -->
+  <button id="panelTab" class="panel-tab" title="Toggle controls">☰</button>
+
+  <!-- Sliding panel wrapper -->
+  <div id="panel" class="">
+    <div id="panelInner">
+      <div class="row">
+        <button id="reset" class="btn">Reset</button>
+        <label>N</label><input id="n" type="range" min="256" max="16384" step="256" value="4096"><span id="nV"></span>
+        <label>dt</label><input id="dt" type="range" min="0.002" max="0.2" step="0.002" value="0.04"><span id="dtV"></span>
+        <label>μ<sub>k</sub></label><input id="muK" type="range" min="0.5" max="8.0" step="0.05" value="4.0"><span id="muKV"></span>
+        <label>σ<sub>k</sub></label><input id="sigK" type="range" min="0.2" max="4.0" step="0.02" value="1.0"><span id="sigKV"></span>
+        <label>μ<sub>g</sub></label><input id="muG" type="range" min="0.0" max="1.2" step="0.01" value="0.6"><span id="muGV"></span>
+        <label>σ<sub>g</sub></label><input id="sigG" type="range" min="0.05" max="0.6" step="0.01" value="0.15"><span id="sigGV"></span>
+        <label>c<sub>rep</sub></label><input id="cRep" type="range" min="0.0" max="4.0" step="0.02" value="1.0"><span id="cRepV"></span>
+        <label>w<sub>k</sub></label><input id="wK" type="range" min="0.001" max="0.2" step="0.001" value="0.022"><span id="wKV"></span>
+        <label>Trail</label><input id="trail" type="range" min="0.0" max="1.0" step="0.02" value="0.85"><span id="trailV"></span>
+        <label>Auto‑fit</label><input id="autofit" type="checkbox" checked>
+      </div>
+      <div class="row">
+        <label>Mouse</label>
+        <select id="mouseType">
+          <option value="0" selected>Attract</option>
+          <option value="1">Repel</option>
+          <option value="2">Twirl (CW)</option>
+          <option value="3">Twirl (CCW)</option>
+          <option value="-1">Off</option>
+        </select>
+        <label>Radius</label><input id="mRad" type="range" min="5" max="120" step="1" value="40"><span id="mRadV">40</span>
+        <label>Strength</label><input id="mStr" type="range" min="0" max="6" step="0.05" value="2"><span id="mStrV">2.00</span>
+      </div>
+      <div class="row">
+        <label>Color rule</label>
+        <select id="rule">
+          <option value="0">Index</option>
+          <option value="1">Radius</option>
+          <option value="2">Angle</option>
+          <option value="3" selected>Speed</option>
+        </select>
+        <label># Colors</label><input id="numColors" type="range" min="1" max="12" step="1" value="6"><span id="numColorsV">6</span>
+        <label>Hue</label><input id="hue" type="range" min="0" max="1" step="0.01" value="0.0"><span id="hueV">0.00</span>
+        <label>Sat</label><input id="sat" type="range" min="0" max="1" step="0.01" value="0.9"><span id="satV">0.90</span>
+        <label>Val</label><input id="val" type="range" min="0" max="1" step="0.01" value="1.0"><span id="valV">1.00</span>
+        <span id="fps"></span>
+        <span id="diag"></span>
+      </div>
+      <div class="row">
+        <label>Nav speed</label><input id="navSpeed" type="range" min="0.1" max="2.0" step="0.05" value="0.40"><span id="navSpeedV">0.40</span>
+        <button id="clearTrails" class="btn" title="Clear trail buffer">Clear Trails</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span>HUD arrows to pan. Wheel/Pinch = zoom. Double‑click to recenter. Space = pause.
+          Hold mouse/touch to interact according to the selected mouse mode.</span>
+        <span style="margin-left:12px"><a href="https://google-research.github.io/self-organising-systems/particle-lenia/" target="_blank" rel="noreferrer">Model reference</a></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- On‑screen panner / zoom HUD (appears fully on hover) -->
+  <div id="hudPanner" title="Hover to reveal; click or hold to pan/zoom">
+    <button id="btnZoomIn" class="hudBtn" aria-label="Zoom in" title="Zoom in">＋</button>
+    <button id="btnPanUp" class="hudBtn" aria-label="Pan up" title="Pan up">▲</button>
+    <div></div>
+    <button id="btnPanLeft" class="hudBtn" aria-label="Pan left" title="Pan left">◀</button>
+    <div></div>
+    <button id="btnPanRight" class="hudBtn" aria-label="Pan right" title="Pan right">▶</button>
+    <div></div>
+    <button id="btnPanDown" class="hudBtn" aria-label="Pan down" title="Pan down">▼</button>
+    <button id="btnZoomOut" class="hudBtn" aria-label="Zoom out" title="Zoom out">－</button>
+  </div>
+
+  <canvas id="gl"></canvas>
+
+  <script>
+  function main(){
+    const glCanvas = document.getElementById('gl');
+    const dpr = 1; // DPR=1 for speed
+    const gl = glCanvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+    if (!gl) { alert('WebGL2 required'); return; }
+    const extColorFloat = gl.getExtension('EXT_color_buffer_float');
+
+    const VERT = getSrc('quad-vs');
+    const SIM_FS = getSrc('sim-fs');
+    const DRAW_VS = getSrc('draw-vs');
+    const DRAW_FS = getSrc('draw-fs');
+    const BLIT_FS = getSrc('blit-fs');
+    function getSrc(id){ const el=document.getElementById(id); return el ? el.textContent : ''; }
+    function compile(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){ throw new Error(gl.getShaderInfoLog(s)||'Shader compile error'); } return s; }
+    function program(vs, fs){ const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); if(!gl.getProgramParameter(p, gl.LINK_STATUS)){ throw new Error(gl.getProgramInfoLog(p)||'Link error'); } return p; }
+
+    function makePosTex(w,h){ const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null); return tex; }
+    function makeColorTex(w,h){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); return t; }
+    function fbStatusString(status){ const gls=gl; const map={}; map[gls.FRAMEBUFFER_COMPLETE]='FRAMEBUFFER_COMPLETE'; map[gls.FRAMEBUFFER_INCOMPLETE_ATTACHMENT]='INCOMPLETE_ATTACHMENT'; map[gls.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT]='MISSING_ATTACHMENT'; map[gls.FRAMEBUFFER_INCOMPLETE_DIMENSIONS]='INCOMPLETE_DIMENSIONS'; map[gls.FRAMEBUFFER_UNSUPPORTED]='UNSUPPORTED'; return map[status]||('Unknown 0x'+status.toString(16)); }
+    function makeFBO(tex){ const fb=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0); gl.drawBuffers([gl.COLOR_ATTACHMENT0]); const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER); if(status!==gl.FRAMEBUFFER_COMPLETE){ console.error('FBO status:', fbStatusString(status)); throw new Error('FBO incomplete'); } gl.bindFramebuffer(gl.FRAMEBUFFER, null); return fb; }
+
+    // Geometry
+    const quad = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quad); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+
+    // State
+    let N = 4096, texSide = 64; function fitSide(n){ return Math.ceil(Math.sqrt(n)); }
+    let posA, posB, posFBOA, posFBOB; let colorA, colorB, fboColorA, fboColorB;
+    let cam = { zoom: 65.0, cx: 0.0, cy: 0.0 };
+    const worldR = 80.0; // reference radius
+
+    // UI
+    const ui = { panel:qs('#panel'), panelTab:qs('#panelTab'), reset:qs('#reset'), n:qs('#n'), nV:qs('#nV'), dt:qs('#dt'), dtV:qs('#dtV'), muK:qs('#muK'), muKV:qs('#muKV'), sigK:qs('#sigK'), sigKV:qs('#sigKV'), muG:qs('#muG'), muGV:qs('#muGV'), sigG:qs('#sigG'), sigGV:qs('#sigGV'), cRep:qs('#cRep'), cRepV:qs('#cRepV'), wK:qs('#wK'), wKV:qs('#wKV'), trail:qs('#trail'), trailV:qs('#trailV'), autofit:qs('#autofit'), mouseType:qs('#mouseType'), mRad:qs('#mRad'), mRadV:qs('#mRadV'), mStr:qs('#mStr'), mStrV:qs('#mStrV'), rule:qs('#rule'), numColors:qs('#numColors'), numColorsV:qs('#numColorsV'), hue:qs('#hue'), hueV:qs('#hueV'), sat:qs('#sat'), satV:qs('#satV'), val:qs('#val'), valV:qs('#valV'), navSpeed:qs('#navSpeed'), navSpeedV:qs('#navSpeedV'), clearTrails:qs('#clearTrails'), fps:qs('#fps'), diag:qs('#diag') };
+    function qs(s){ return document.querySelector(s); }
+    function updLabels(){ ui.nV.textContent=ui.n.value; ui.dtV.textContent=(+ui.dt.value).toFixed(3); ui.muKV.textContent=(+ui.muK.value).toFixed(2); ui.sigKV.textContent=(+ui.sigK.value).toFixed(2); ui.muGV.textContent=(+ui.muG.value).toFixed(2); ui.sigGV.textContent=(+ui.sigG.value).toFixed(2); ui.cRepV.textContent=(+ui.cRep.value).toFixed(2); ui.wKV.textContent=(+ui.wK.value).toFixed(3); ui.trailV.textContent=(+ui.trail.value).toFixed(2); ui.mRadV.textContent=ui.mRad.value; ui.mStrV.textContent=(+ui.mStr.value).toFixed(2); ui.numColorsV.textContent=ui.numColors.value; ui.hueV.textContent=(+ui.hue.value).toFixed(2); ui.satV.textContent=(+ui.sat.value).toFixed(2); ui.valV.textContent=(+ui.val.value).toFixed(2); if(ui.navSpeed) ui.navSpeedV.textContent=(+ui.navSpeed.value).toFixed(2); }
+    Array.from(document.querySelectorAll('input[type=range], select, input[type=checkbox]')).forEach(e=>e.addEventListener('input', ()=>{ updLabels(); if(e===ui.n) init(); })); ui.reset.addEventListener('click', ()=>init());
+
+    // Panel toggle with remembered state
+    const prefKey='lenia.panel.collapsed';
+    try{ if(localStorage.getItem(prefKey)==='1') ui.panel.classList.add('collapsed'); }catch(_){ }
+    ui.panelTab.addEventListener('click', ()=>{ ui.panel.classList.toggle('collapsed'); try{ localStorage.setItem(prefKey, ui.panel.classList.contains('collapsed')?'1':'0'); }catch(_){ } });
+    updLabels();
+    if(ui.clearTrails){ ui.clearTrails.addEventListener('click', ()=>forceClearTrails()); }
+
+    // === Auto‑fit logic (apply only on toggle/init/resize, not every frame) ===
+    function applyAutoFit(){ const margin=1.3; cam.cx=0.0; cam.cy=0.0; cam.zoom=2.0*worldR*margin; camMoved(); }
+    ui.autofit.addEventListener('change', ()=>{ if(ui.autofit.checked) applyAutoFit(); });
+
+    // HUD panner logic (click or hold for repeat)
+    const btn = {
+      up: document.getElementById('btnPanUp'), down: document.getElementById('btnPanDown'), left: document.getElementById('btnPanLeft'), right: document.getElementById('btnPanRight'), zin: document.getElementById('btnZoomIn'), zout: document.getElementById('btnZoomOut')
+    };
+    function panPx(dx, dy){ const nav = (ui.navSpeed? +ui.navSpeed.value : 0.4); const k = (cam.zoom / glCanvas.height) * 0.25 * nav; cam.cx += dx * k; cam.cy -= dy * k; ui.autofit.checked=false; camMoved(); }
+    function zoomFac(f){ const nav = (ui.navSpeed? +ui.navSpeed.value : 0.4); cam.zoom = Math.max(5.0, Math.min(200.0, cam.zoom * Math.pow(f, nav))); ui.autofit.checked=false; camMoved(); }
+    function holdPress(el, fn){ let tid=null; const step=()=>{ fn(); tid=requestAnimationFrame(step); }; const start=()=>{ fn(); if(!tid) tid=requestAnimationFrame(step); }; const stop=()=>{ if(tid){ cancelAnimationFrame(tid); tid=null; } }; el.addEventListener('mousedown', start); window.addEventListener('mouseup', stop); el.addEventListener('touchstart', (e)=>{ e.preventDefault(); start(); }, {passive:false}); window.addEventListener('touchend', stop, {passive:true}); el.addEventListener('click', fn); }
+    holdPress(btn.up, ()=>panPx(0,-10));
+    holdPress(btn.down, ()=>panPx(0,10));
+    holdPress(btn.left, ()=>panPx(-10,0));
+    holdPress(btn.right, ()=>panPx(10,0));
+    holdPress(btn.zin, ()=>zoomFac(0.93));
+    holdPress(btn.zout, ()=>zoomFac(1.07));
+
+    // Interaction: remove mouse/touch DRAG panning; keep wheel zoom & mouse forces
+    let mouseDown=false; let mouseWorld=[0,0];
+    glCanvas.addEventListener('mousedown',(e)=>{ mouseDown=true; updateMouse(e); ui.autofit.checked=false; });
+    window.addEventListener('mouseup',()=>{ mouseDown=false; });
+    window.addEventListener('mousemove',(e)=>{ updateMouse(e); });
+    glCanvas.addEventListener('dblclick',()=>{ cam.cx=0; cam.cy=0; camMoved(); });
+    glCanvas.addEventListener('wheel',(e)=>{ e.preventDefault(); const nav=(ui.navSpeed? +ui.navSpeed.value : 0.4); const factor = Math.exp(-e.deltaY*0.001*nav); cam.zoom = Math.max(5.0, Math.min(200.0, cam.zoom*factor)); ui.autofit.checked=false; camMoved(); }, {passive:false});
+    glCanvas.addEventListener('touchstart', (e)=>{ if(e.touches.length===1){ mouseDown=true; updateMouse(e.touches[0]); ui.autofit.checked=false; } }, {passive:false});
+    glCanvas.addEventListener('touchmove', (e)=>{ if(e.touches.length===1){ updateMouse(e.touches[0]); } }, {passive:false});
+    window.addEventListener('touchend', ()=>{ mouseDown=false; }, {passive:true});
+
+    function updateMouse(e){ const rect=glCanvas.getBoundingClientRect(); const x=(e.clientX-rect.left)*dpr; const y=(e.clientY-rect.top)*dpr; const uvx=x/glCanvas.width, uvy=y/glCanvas.height; const aspect=glCanvas.width/glCanvas.height; const halfSpan=cam.zoom*0.5; const wx=(uvx-0.5)*(halfSpan*aspect)*2.0 + cam.cx; const wy=(0.5-uvy)*halfSpan*2.0 + cam.cy; mouseWorld=[wx,wy]; }
+
+    // Resize & color buffers
+    function resize(){ const w=glCanvas.clientWidth, h=glCanvas.clientHeight; glCanvas.width = Math.floor(w*dpr); glCanvas.height = Math.floor(h*dpr); gl.viewport(0,0,glCanvas.width, glCanvas.height); }
+    window.addEventListener('resize', ()=>{ resize(); rebuildColorTargets(); if(ui.autofit.checked) applyAutoFit(); }); resize();
+
+    const simProg = program(VERT, SIM_FS);
+    const drawProg = program(DRAW_VS, DRAW_FS);
+    const blitProg = program(VERT, BLIT_FS);
+
+    // Color ping‑pong for trails
+    function rebuildColorTargets(){ colorA && gl.deleteTexture(colorA); colorB && gl.deleteTexture(colorB); fboColorA && gl.deleteFramebuffer(fboColorA); fboColorB && gl.deleteFramebuffer(fboColorB); colorA = makeColorTex(glCanvas.width, glCanvas.height); colorB = makeColorTex(glCanvas.width, glCanvas.height); fboColorA = makeFBO(colorA); fboColorB = makeFBO(colorB); forceClearTrails(); }
+    function forceClearTrails(){ gl.bindFramebuffer(gl.FRAMEBUFFER, fboColorA); gl.clearColor(0.045,0.055,0.07,1); gl.clear(gl.COLOR_BUFFER_BIT); gl.bindFramebuffer(gl.FRAMEBUFFER, fboColorB); gl.clear(gl.COLOR_BUFFER_BIT); gl.bindFramebuffer(gl.FRAMEBUFFER, null); }
+    function camMoved(){ forceClearTrails(); }
+
+    function init(){ N = +ui.n.value; texSide = fitSide(N); posA && gl.deleteTexture(posA); posB && gl.deleteTexture(posB); posFBOA && gl.deleteFramebuffer(posFBOA); posFBOB && gl.deleteFramebuffer(posFBOB); posA = makePosTex(texSide, texSide); posB = makePosTex(texSide, texSide); posFBOA = makeFBO(posA); posFBOB = makeFBO(posB); const data = new Float32Array(texSide*texSide*4); for(let i=0;i<N;i++){ const t = Math.random()*Math.PI*2; const r = (Math.random()*0.5) * 20.0; const x = Math.cos(t)*r; const y = Math.sin(t)*r; data[i*4+0]=x; data[i*4+1]=y; data[i*4+2]=0.0; data[i*4+3]=1.0; } gl.bindTexture(gl.TEXTURE_2D, posA); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0,0, texSide, texSide, gl.RGBA, gl.FLOAT, data); gl.bindTexture(gl.TEXTURE_2D, posB); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0,0, texSide, texSide, gl.RGBA, gl.FLOAT, data); rebuildColorTargets(); runDiagnostics(); if(ui.autofit.checked) applyAutoFit(); }
+
+    init();
+
+    // Main loop
+    let last=performance.now(), acc=0, frames=0; function frame(t){ const dtReal=(t-last)/1000; last=t; acc+=dtReal; frames++; if(acc>0.5){ ui.fps.textContent=((frames/acc).toFixed(1)+' fps'); acc=0; frames=0; } step(); requestAnimationFrame(frame); } requestAnimationFrame(frame);
+
+    function step(){
+      const uniforms = { muK:+ui.muK.value, sigK:+ui.sigK.value, muG:+ui.muG.value, sigG:+ui.sigG.value, cRep:+ui.cRep.value, wK:+ui.wK.value, dt:+ui.dt.value, trail:+ui.trail.value };
+
+      // SIM: posA -> posB
+      gl.useProgram(simProg); gl.bindVertexArray(vao); gl.bindFramebuffer(gl.FRAMEBUFFER, posFBOB); gl.viewport(0,0,texSide,texSide);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, posA); gl.uniform1i(gl.getUniformLocation(simProg,'uPos'), 0);
+      gl.uniform1i(gl.getUniformLocation(simProg,'uSide'), texSide);
+      gl.uniform1i(gl.getUniformLocation(simProg,'uCount'), N);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uDt'), uniforms.dt);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uMuK'), uniforms.muK);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uSigK'), uniforms.sigK);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uWK'), uniforms.wK);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uMuG'), uniforms.muG);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uSigG'), uniforms.sigG);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uCRep'), uniforms.cRep);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uWorldR'), worldR);
+      // Mouse uniforms
+      const mType = parseInt(ui.mouseType.value,10); const mOn = (mType !== -1) && mouseDown;
+      gl.uniform1i(gl.getUniformLocation(simProg,'uMouseOn'), mOn ? 1 : 0);
+      gl.uniform2f(gl.getUniformLocation(simProg,'uMouse'), mouseWorld[0], mouseWorld[1]);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uMouseR'), +ui.mRad.value);
+      gl.uniform1f(gl.getUniformLocation(simProg,'uMouseStr'), +ui.mStr.value);
+      gl.uniform1i(gl.getUniformLocation(simProg,'uMouseType'), mType<0?0:mType);
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      // swap positions
+      let tmp=posA; posA=posB; posB=tmp; tmp=posFBOA; posFBOA=posFBOB; posFBOB=tmp;
+
+      // DRAW with trails & color rules
+      gl.useProgram(drawProg); gl.bindVertexArray(vao); gl.bindFramebuffer(gl.FRAMEBUFFER, fboColorB); gl.viewport(0,0,glCanvas.width, glCanvas.height);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, posA); gl.uniform1i(gl.getUniformLocation(drawProg,'uPos'),0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, colorA); gl.uniform1i(gl.getUniformLocation(drawProg,'uPrev'),1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, posB); gl.uniform1i(gl.getUniformLocation(drawProg,'uPosPrev'),2);
+      gl.uniform2f(gl.getUniformLocation(drawProg,'uRes'), glCanvas.width, glCanvas.height);
+      gl.uniform1i(gl.getUniformLocation(drawProg,'uSide'), texSide);
+      gl.uniform1i(gl.getUniformLocation(drawProg,'uCount'), N);
+      gl.uniform3f(gl.getUniformLocation(drawProg,'uCam'), cam.cx, cam.cy, cam.zoom);
+      gl.uniform1f(gl.getUniformLocation(drawProg,'uTrail'), uniforms.trail);
+      gl.uniform1i(gl.getUniformLocation(drawProg,'uRule'), parseInt(ui.rule.value,10));
+      gl.uniform1i(gl.getUniformLocation(drawProg,'uNumColors'), parseInt(ui.numColors.value,10));
+      gl.uniform1f(gl.getUniformLocation(drawProg,'uHueShift'), +ui.hue.value);
+      gl.uniform1f(gl.getUniformLocation(drawProg,'uSat'), +ui.sat.value);
+      gl.uniform1f(gl.getUniformLocation(drawProg,'uVal'), +ui.val.value);
+      gl.drawArrays(gl.POINTS, 0, N);
+
+      // Present to screen
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0,0,glCanvas.width, glCanvas.height); blit(colorB);
+      // swap color ping‑pong
+      let tc=colorA; colorA=colorB; colorB=tc; let fc=fboColorA; fboColorA=fboColorB; fboColorB=fc;
+    }
+
+    function blit(tex){ const prog=blitProg; gl.useProgram(prog); gl.bindVertexArray(vao); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(gl.getUniformLocation(prog,'uTex'),0); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
+
+    // Diagnostics / tests
+    function runDiagnostics(){ const msgs=[]; msgs.push(gl ? '✅ WebGL2 context' : '❌ WebGL2 context'); msgs.push(extColorFloat ? '✅ EXT_color_buffer_float' : '⚠️ No EXT_color_buffer_float');
+      try { if(makeFBO(makePosTex(4,4))) msgs.push('✅ Pos FBO (RGBA32F) complete'); } catch(e){ msgs.push('❌ Pos FBO failed'); }
+      try { if(makeFBO(makeColorTex(4,4))) msgs.push('✅ Color FBO (RGBA8) complete'); } catch(e){ msgs.push('❌ Color FBO failed'); }
+      try { const p1=program(VERT, SIM_FS); gl.deleteProgram(p1); msgs.push('✅ SIM shader linked'); } catch(e){ msgs.push('❌ SIM shader link fail'); }
+      try { const p2=program(DRAW_VS, DRAW_FS); gl.deleteProgram(p2); msgs.push('✅ DRAW shader linked'); } catch(e){ msgs.push('❌ DRAW shader link fail'); }
+      try { const p3=program(VERT, BLIT_FS); gl.deleteProgram(p3); msgs.push('✅ BLIT shader linked'); } catch(e){ msgs.push('❌ BLIT shader link fail'); }
+      try { gl.useProgram(simProg); gl.uniform1i(gl.getUniformLocation(simProg,'uMouseOn'), 0); msgs.push('✅ Mouse uniforms ok'); } catch(e){ msgs.push('❌ Mouse uniform fail'); }
+      document.querySelector('#diag').textContent = msgs.join(' · ');
+    }
+  }
+  document.addEventListener('DOMContentLoaded', main);
+  </script>
+</body>
+</html>
